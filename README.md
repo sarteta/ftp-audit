@@ -1,76 +1,78 @@
 # ftp-audit
 
-Auditoría read-only de un sitio web en hosting compartido. Soporta **SFTP**, **FTPS** y **FTP** plano. Detecta los vectores típicos de SEO injection, pharma hack, japanese keyword hack y backdoors PHP.
+Read-only audit of a website served from shared hosting. Supports **SFTP**, **FTPS**, and plain **FTP**. Detects common SEO-injection, pharma-hack, japanese-keyword-hack vectors and PHP backdoors.
 
-Pensado para pymes con sitios estáticos en hosting tipo cPanel/Plesk.
+Aimed at small businesses with static sites on cPanel/Plesk-style shared hosting.
 
-## Protocolos soportados
+Lectura en español: [README.es.md](./README.es.md)
 
-| Protocolo | Puerto default | Encriptación | Recomendado | Cuándo usar |
+## Supported protocols
+
+| Protocol | Default port | Encryption | Recommended | When to use |
 |---|---|---|---|---|
-| **SFTP** (FTP sobre SSH) | 22 | SSH | ✅ sí | Default. Hosting moderno (cPanel, Plesk, DreamHost, SiteGround, A2, Hostinger). También soporta auth por private key. |
-| **FTPS** (FTP sobre TLS) | 21 / 990 | TLS | ✅ sí | Hosting que da FTP "seguro" pero no SSH abierto. |
-| **FTP** plano | 21 | ❌ ninguna | ⚠ último recurso | Hosting compartido low-cost que solo expone FTP plano. Las credenciales viajan en cleartext, correr solo desde redes confiables. |
+| **SFTP** (FTP over SSH) | 22 | SSH | yes | Default. Modern shared hosting (cPanel, Plesk, DreamHost, SiteGround, A2, Hostinger). Also supports private-key auth. |
+| **FTPS** (FTP over TLS) | 21 / 990 | TLS | yes | Hosting that exposes "secure" FTP but does not allow SSH. |
+| **FTP** plain | 21 | none | last resort | Cheap shared hosting that only exposes plain FTP. Credentials travel in cleartext, only run from trusted networks. |
 
-Configurás el protocolo con `FTP_PROTOCOL=sftp | ftps | ftp` en `.env`. Default es `sftp`.
+Set the protocol with `FTP_PROTOCOL=sftp | ftps | ftp` in `.env`. Default is `sftp`.
 
-## Cómo funciona
+## How it works
 
 ```mermaid
 flowchart TD
-    A[Creds en .env<br/>FTP_PROTOCOL=sftp default] --> B{Protocolo}
+    A[Creds in .env<br/>FTP_PROTOCOL=sftp default] --> B{Protocol}
     B -->|sftp| S[SftpAdapter<br/>ssh2-sftp-client]
     B -->|ftps| F[BasicFtpAdapter<br/>basic-ftp + TLS]
-    B -->|ftp| P[BasicFtpAdapter<br/>basic-ftp plano]
-    S --> C[Walk recursivo<br/>filesystem remoto]
+    B -->|ftp| P[BasicFtpAdapter<br/>basic-ftp plain]
+    S --> C[Recursive walk<br/>of remote filesystem]
     F --> C
     P --> C
-    C --> D[mtime por archivo]
-    D --> E1[Archivos no esperados<br/>en root]
-    D --> E2[Archivos PHP en<br/>sitios estaticos]
-    D --> E3[Nombres sospechosos<br/>shell.php / c99 / .suspected]
-    D --> E4[Pattern match PHP<br/>eval base64 / preg_e / shell_exec]
-    D --> E5[.htaccess<br/>redirects condicionales]
-    D --> E6[Modificados fuera<br/>de ventana de deploy]
-    E1 --> R[Reporte por categoria<br/>a stdout]
+    C --> D[mtime per file]
+    D --> E1[Files not expected<br/>in root]
+    D --> E2[PHP files in<br/>static sites]
+    D --> E3[Suspicious filenames<br/>shell.php / c99 / .suspected]
+    D --> E4[PHP pattern match<br/>eval base64 / preg_e / shell_exec]
+    D --> E5[.htaccess<br/>conditional redirects]
+    D --> E6[Modified outside<br/>deploy window]
+    E1 --> R[Categorized report<br/>to stdout]
     E2 --> R
     E3 --> R
     E4 --> R
     E5 --> R
     E6 --> R
-    R --> X{Hallazgos<br/>criticos?}
-    X -->|si| EX1[exit 1<br/>alertar]
+    R --> X{Critical<br/>findings?}
+    X -->|yes| EX1[exit 1<br/>alert]
     X -->|no| EX0[exit 0<br/>OK]
-    B -.->|fallo conexion| EX2[exit 2<br/>error]
+    B -.->|connection failed| EX2[exit 2<br/>error]
 ```
 
-Todo es READ-ONLY. No descarga al disco local, no modifica nada en el server. Lee a buffer en memoria, analiza y reporta.
+Everything is READ-ONLY. No downloads to local disk, no writes to the server. The script reads file content into memory buffers, analyzes, and reports.
 
-## Resultados esperados
+## Expected findings
 
-| Categoría | Hallazgo típico | Severidad | Acción sugerida |
+| Category | Typical hit | Severity | Suggested action |
 |---|---|---|---|
-| Archivos PHP en sitio estático | `contacto.php`, `mailer.php`, `wp-login.php` en sitio HTML puro | media | revisar contenido; legítimo si lo agregaste vos |
-| Nombres sospechosos | `shell.php`, `c99.php`, `r57.php`, `*.suspected`, `.bak` | crítica | borrar y rotar credenciales |
-| Patrones de backdoor en PHP | `eval(base64_decode(...))`, `assert($_POST[...])`, `preg_replace('/.../e')`, `system($_GET[...])` | crítica | eliminar archivo, scan completo de host |
-| .htaccess con redirects condicionales | `RewriteCond` por `User-Agent` / `Referrer` / `Accept-Language` | media | revisar manualmente; legítimo si redirige por idioma, sospechoso si por googlebot |
-| Archivos fuera del root esperado | `/public_html/seo/`, `/public_html/pgsoft/`, dominios pharma/casino | crítica | borrar y solicitar reindexación a Google |
-| Archivos modificados fuera de ventana | Cualquier escritura sin deploy correspondiente en últimos 90 días | media | correlacionar con logs del hosting |
+| PHP file in a static site | `contacto.php`, `mailer.php`, `wp-login.php` in pure-HTML site | medium | review content; legitimate if you added it |
+| Suspicious filename | `shell.php`, `c99.php`, `r57.php`, `*.suspected`, `.bak` | critical | delete and rotate credentials |
+| PHP backdoor pattern | `eval(base64_decode(...))`, `assert($_POST[...])`, `preg_replace('/.../e')`, `system($_GET[...])` | critical | delete file, full host scan |
+| `.htaccess` with conditional redirect | `RewriteCond` by `User-Agent` / `Referrer` / `Accept-Language` | medium | manual review; legitimate for language redirects, suspicious if keyed on Googlebot |
+| File outside expected root | `/public_html/seo/`, `/public_html/pgsoft/`, pharma/casino domains | critical | delete and request reindex from Google |
+| File modified outside deploy window | Any write in last 90 days without a corresponding deploy | medium | correlate with hosting access logs |
 
-Exit codes para integrar con cron + alerter:
+Exit codes for cron + alerter integration:
 
-| Code | Significado |
+| Code | Meaning |
 |---|---|
-| `0` | Sin hallazgos críticos |
-| `1` | Encontró PHP con patrones de hack o nombres sospechosos |
-| `2` | Error fatal de conexión |
+| `0` | No critical findings |
+| `1` | PHP with hack patterns or suspicious names found |
+| `2` | Fatal connection error |
 
-## Cuándo usarlo
+## When to run it
 
-- Después de detectar resultados raros en `site:tudominio.com` en Google
-- Como chequeo periódico (cron semanal con alerter por email)
-- Antes de tomar un proyecto heredado, para saber qué hay
-- Después de un incidente, para confirmar que el filesystem quedó limpio
+- After noticing odd results in a `site:yourdomain.com` Google search
+- As a periodic check (weekly cron with email alerter)
+- Before taking over an inherited project, to know what is on the server
+- After an incident, to confirm the filesystem is clean
 
 ## Setup
 
@@ -79,100 +81,100 @@ git clone https://github.com/sarteta/ftp-audit.git
 cd ftp-audit
 npm install
 cp .env.example .env
-# editá .env con tu protocolo y credenciales
+# fill in your protocol and credentials
 node ftp-audit.js
 ```
 
-## Configuración (`.env`)
+## Configuration (`.env`)
 
-Mínimo para SFTP (recomendado):
+Minimum config for SFTP (recommended):
 
 ```
 FTP_PROTOCOL=sftp
-FTP_HOST=tu-host.example.com
-FTP_USER=tu-usuario
-FTP_PASS=tu-password
+FTP_HOST=your-host.example.com
+FTP_USER=your-username
+FTP_PASS=your-password
 FTP_PATH=/public_html
 ```
 
-Mínimo para FTPS:
+Minimum config for FTPS:
 
 ```
 FTP_PROTOCOL=ftps
-FTP_HOST=tu-host.example.com
-FTP_USER=tu-usuario
-FTP_PASS=tu-password
+FTP_HOST=your-host.example.com
+FTP_USER=your-username
+FTP_PASS=your-password
 FTP_PATH=/public_html
 ```
 
-Mínimo para FTP plano (no recomendado, solo redes confiables):
+Minimum config for plain FTP (not recommended, only on trusted networks):
 
 ```
 FTP_PROTOCOL=ftp
-FTP_HOST=tu-host.example.com
-FTP_USER=tu-usuario
-FTP_PASS=tu-password
+FTP_HOST=your-host.example.com
+FTP_USER=your-username
+FTP_PASS=your-password
 FTP_PATH=/public_html
 ```
 
-### Auth por private key (solo SFTP)
+### Private-key auth (SFTP only)
 
-Si tu hosting permite SSH key, podés usar key en lugar de password:
+If your hosting allows SSH key auth, you can use a key instead of a password:
 
 ```
 FTP_PROTOCOL=sftp
-FTP_HOST=tu-host.example.com
-FTP_USER=tu-usuario
-SFTP_KEY_PATH=/home/usuario/.ssh/id_rsa
+FTP_HOST=your-host.example.com
+FTP_USER=your-username
+SFTP_KEY_PATH=/home/user/.ssh/id_rsa
 SFTP_KEY_PASSPHRASE=
 FTP_PATH=/public_html
 ```
 
-Si seteás `SFTP_KEY_PATH`, `FTP_PASS` se ignora.
+If `SFTP_KEY_PATH` is set, `FTP_PASS` is ignored.
 
-### Whitelist de root (`EXPECTED_ROOT`)
+### Root whitelist (`EXPECTED_ROOT`)
 
 ```
 EXPECTED_ROOT=index.html,index.php,robots.txt,sitemap.xml,favicon.ico,.htaccess,css,js,img,images,assets,fonts
 ```
 
-Cualquier archivo o carpeta en el root que no esté en esta lista se reporta como sospechoso. Personalizalo según tu sitio.
+Any file or folder in the root that is not in this list is reported as suspicious. Customize for your site.
 
-## Salida
+## Sample output
 
 ```
 ========================================
-RESUMEN
+SUMMARY
 ========================================
-Protocolo        : SFTP
-Archivos totales : 89
-Directorios      : 6
-Bytes totales    : 37.25 MB
+Protocol         : SFTP
+Total files      : 89
+Directories      : 6
+Total bytes      : 37.25 MB
 
 ========================================
-ARCHIVOS NO ESPERADOS EN ROOT
+UNEXPECTED FILES IN ROOT
 ========================================
   [FILE] /public_html/contacto.php  2322B
   [DIR]  /public_html/folletos
   [DIR]  /public_html/fonts
 
 ========================================
-NOMBRES SOSPECHOSOS
+SUSPICIOUS NAMES
 ========================================
-  (ninguno) OK
+  (none) OK
 
 ========================================
-ARCHIVOS PHP
+PHP FILES
 ========================================
   /public_html/contacto.php  2322B
 
 ========================================
-PHP CON PATRONES DE HACK
+PHP WITH HACK PATTERNS
 ========================================
-  (ninguno) OK
+  (none) OK
 
 ========================================
-.htaccess (revisar redirects condicionales)
+.htaccess (review for conditional redirects)
 ========================================
 <IfModule mod_rewrite.c>
     RewriteCond %{HTTPS} off
@@ -180,26 +182,39 @@ PHP CON PATRONES DE HACK
 </IfModule>
 ```
 
-Útil para dejarlo en cron y enganchar con un alerter:
+Useful as a cron + alerter:
 
 ```bash
 0 4 * * 0  cd /opt/ftp-audit && node ftp-audit.js > /var/log/ftp-audit.log 2>&1 || mail -s "FTP audit FAIL" admin@example.com < /var/log/ftp-audit.log
 ```
 
-## Limitaciones
+## Tests
 
-- No detecta hacks que viven 100% fuera del filesystem (DB injections, malicious cron, registros DNS comprometidos)
-- No detecta cloaking si el servidor solo se compromete cuando ve User-Agent específico. Para eso probar `curl -A "Googlebot" tudominio.com` y comparar con `curl tudominio.com`
-- Whitelist de nombres sospechosos es heurística, hay falsos positivos. Revisar cada match con criterio
-- El pattern matching de PHP detecta los backdoors clásicos, no obfuscados con técnicas custom
-- Para sitios muy grandes (>5000 archivos) puede tardar varios minutos. Ajustar `maxDepth` en el código si tu árbol es muy profundo
+```bash
+npm test
+```
 
-Si el script dice "todo limpio" y aun así sospechás del sitio:
+Runs 10 detection cases against synthetic backdoor samples in `tests/samples/`. Verifies that each PHP hack pattern matches what it claims to match, and explicitly demonstrates two known evasion techniques the simple regex cannot catch (string-concatenation obfuscation, variable indirection between user input and the dangerous call).
 
-1. Probar `curl -A "Googlebot" tudominio.com` y comparar con `curl tudominio.com`. Si difieren, hay cloaking
-2. Buscar en Google `site:tudominio.com` y revisar los titles indexados
-3. Mirar los logs de acceso del servidor por requests raros a paths que no existen
+## Limitations
 
-## Licencia
+The detection layer is a regex scanner over PHP source. It catches the unobfuscated payloads that automated mass-injection campaigns use, which covers most threats hitting cheap shared hosting. It does NOT catch:
+
+- Backdoors with custom obfuscation, charcode encoding, or polymorphic mutation
+- Indirect call chains where user input is assigned to a variable before being passed to a dangerous function (proven in `tests/samples/backdoor-mail-indirect-evasion.php`)
+- Backdoors hidden in non-PHP extensions (image polyglots, `.htaccess` PHP execution rules pointing at innocent-looking files)
+- Hacks that live entirely outside the filesystem (DB injections, malicious cron, hijacked DNS)
+- Cloaking that only triggers for specific User-Agents. Test with `curl -A "Googlebot" yourdomain.com` and compare to a normal `curl yourdomain.com`
+- Recently-active backdoors that have already self-deleted after running
+
+For high-value sites that face targeted attacks, this is not enough on its own. Run it as a fast first-pass and complement with a real malware scanner (Sucuri, Wordfence for WordPress, ImunifyAV server-side, ClamAV with PHP signatures).
+
+If the script reports clean and you still suspect compromise:
+
+1. Run `curl -A "Googlebot" yourdomain.com` and compare with a normal `curl yourdomain.com`. Different output means cloaking
+2. Search Google `site:yourdomain.com` and check what titles are indexed
+3. Check the hosting access logs for requests to paths that should not exist
+
+## License
 
 MIT
