@@ -1,0 +1,21 @@
+{
+  "name": "ftp-audit",
+  "version": "1.0.0",
+  "description": "Auditoria read-only de sitios web en hosting compartido via FTP. Detecta SEO injection, backdoors PHP y archivos sospechosos.",
+  "main": "ftp-audit.js",
+  "bin": {
+    "ftp-audit": "./ftp-audit.js"
+  },
+  "scripts": {
+    "audit": "node ftp-audit.js"
+  },
+  "keywords": ["ftp", "audit", "security", "seo-injection", "hack-detection", "static-site"],
+  "license": "MIT",
+  "dependencies": {
+    "basic-ftp": "^5.0.0",
+    "dotenv": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
