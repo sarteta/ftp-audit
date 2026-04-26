@@ -1,34 +1,34 @@
 #!/usr/bin/env node
 /**
  * ftp-audit.js
- * Auditoria READ-ONLY de un sitio web servido sobre hosting compartido.
- * Soporta tres protocolos:
- *   - SFTP (FTP sobre SSH, puerto 22)         <- recomendado, encriptado
- *   - FTPS (FTP sobre TLS, puerto 21 o 990)   <- encriptado
- *   - FTP plano (puerto 21)                   <- creds en cleartext, evitar
+ * READ-ONLY audit of a website served from shared hosting.
+ * Supports three protocols:
+ *   - SFTP (FTP over SSH, port 22)            <- recommended, encrypted
+ *   - FTPS (FTP over TLS, port 21 or 990)     <- encrypted
+ *   - plain FTP (port 21)                     <- cleartext creds, avoid
  *
- * Detecta los vectores tipicos de SEO injection / pharma hack / japanese
- * keyword hack / backdoors PHP. Todo read-only: NO descarga al disco local,
- * NO modifica nada en el server.
+ * Detects common SEO injection / pharma hack / japanese keyword hack
+ * vectors and PHP backdoors. Read-only: NO downloads to local disk,
+ * NO writes to the server.
  *
- * Uso:
- *   1. Copia .env.example a .env y completa credenciales
+ * Usage:
+ *   1. Copy .env.example to .env and fill in credentials
  *   2. npm install
  *   3. node ftp-audit.js
  *
- * Licencia: MIT.
+ * License: MIT.
  */
 
 require('dotenv').config();
 const { Writable } = require('stream');
 
-// Resolver protocolo. FTP_PROTOCOL gana sobre FTP_SECURE (legacy).
+// Resolve the protocol. FTP_PROTOCOL wins over FTP_SECURE (legacy).
 function resolveProtocol() {
   const explicit = (process.env.FTP_PROTOCOL || '').toLowerCase().trim();
   if (['sftp', 'ftps', 'ftp'].includes(explicit)) return explicit;
-  // Backwards-compat: FTP_SECURE=true significa FTPS
+  // Backwards-compat: FTP_SECURE=true means FTPS
   if ((process.env.FTP_SECURE || '').toLowerCase() === 'true') return 'ftps';
-  return 'sftp'; // default seguro
+  return 'sftp'; // safe default
 }
 
 const PROTOCOL = resolveProtocol();
@@ -44,19 +44,19 @@ const C = {
 };
 
 if (!C.host || !C.user || !C.pass) {
-  console.error('ERROR: faltan FTP_HOST / FTP_USER / FTP_PASS en .env');
-  console.error('Copia .env.example a .env y completa los valores.');
+  console.error('ERROR: missing FTP_HOST / FTP_USER / FTP_PASS in .env');
+  console.error('Copy .env.example to .env and fill in the values.');
   process.exit(1);
 }
 
-// Whitelist de archivos/carpetas esperados en root.
+// Whitelist of files and folders expected in the site root.
 const EXPECTED_ROOT = new Set((process.env.EXPECTED_ROOT || [
   'index.html', 'index.php',
   'robots.txt', 'sitemap.xml', 'favicon.ico', '.htaccess',
   'css', 'js', 'img', 'images', 'assets', 'fonts',
 ].join(',')).split(',').map(s => s.trim()).filter(Boolean));
 
-// Patrones sospechosos en nombre de archivo
+// Suspicious filename patterns
 const SUSPICIOUS_NAMES = [
   /pgsoft/i, /casino/i, /aposta/i, /jogo/i, /slot/i, /bingo/i, /poker/i,
   /viagra/i, /pharma/i, /pillen/i, /cialis/i, /levitra/i,
@@ -65,26 +65,26 @@ const SUSPICIOUS_NAMES = [
   /^wp-/i, /wordpress/i,
 ];
 
-// Patrones de hack en contenido PHP (cuando descarguemos los .php)
+// Hack patterns in PHP content (matched after downloading each .php file)
 const PHP_HACK_PATTERNS = [
-  { re: /eval\s*\(\s*base64_decode/i, msg: 'eval(base64_decode) - backdoor clasico' },
+  { re: /eval\s*\(\s*base64_decode/i, msg: 'eval(base64_decode) - classic backdoor' },
   { re: /eval\s*\(\s*gzinflate/i, msg: 'eval(gzinflate) - obfuscation' },
   { re: /eval\s*\(\s*str_rot13/i, msg: 'eval(str_rot13) - obfuscation' },
-  { re: /assert\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)/i, msg: 'assert() sobre input' },
-  { re: /\$_(POST|GET|REQUEST)\[[^\]]+\]\s*\(/i, msg: 'callable desde input HTTP' },
-  { re: /preg_replace\s*\([^,]+\/e[^,]*,/i, msg: 'preg_replace con modificador /e (eval)' },
-  { re: /system\s*\(\s*\$_/i, msg: 'system() sobre input' },
-  { re: /shell_exec\s*\(\s*\$_/i, msg: 'shell_exec() sobre input' },
-  { re: /passthru\s*\(\s*\$_/i, msg: 'passthru() sobre input' },
-  { re: /file_put_contents\s*\([^,]+,\s*\$_/i, msg: 'file_put_contents con input no sanitizado' },
-  { re: /move_uploaded_file/i, msg: 'upload handler (revisar contexto)' },
-  { re: /mail\s*\(\s*\$_(POST|GET|REQUEST)/i, msg: 'mail() con destinatario desde input (open relay)' },
-  { re: /\$[a-zA-Z_]+\s*=\s*["'][a-zA-Z0-9+/=]{500,}["']/i, msg: 'String b64 muy largo (probable payload obfuscado)' },
-  { re: /\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/i, msg: 'Hex-encoded payload sospechoso' },
+  { re: /assert\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)/i, msg: 'assert() over input' },
+  { re: /\$_(POST|GET|REQUEST)\[[^\]]+\]\s*\(/i, msg: 'callable from HTTP input' },
+  { re: /preg_replace\s*\([^,]+\/e[^,]*,/i, msg: 'preg_replace with /e modifier (eval)' },
+  { re: /system\s*\(\s*\$_/i, msg: 'system() over input' },
+  { re: /shell_exec\s*\(\s*\$_/i, msg: 'shell_exec() over input' },
+  { re: /passthru\s*\(\s*\$_/i, msg: 'passthru() over input' },
+  { re: /file_put_contents\s*\([^,]+,\s*\$_/i, msg: 'file_put_contents with unsanitized input' },
+  { re: /move_uploaded_file/i, msg: 'upload handler (review context)' },
+  { re: /mail\s*\(\s*\$_(POST|GET|REQUEST)/i, msg: 'mail() with destination from input (open relay)' },
+  { re: /\$[a-zA-Z_]+\s*=\s*["'][a-zA-Z0-9+/=]{500,}["']/i, msg: 'long base64-like string (likely obfuscated payload)' },
+  { re: /\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/i, msg: 'hex-encoded payload' },
 ];
 
 // =========================================================================
-// ADAPTERS por protocolo. Misma interfaz para que walk + analisis no cambien.
+// Per-protocol adapters. Single interface so walk + analysis stay constant.
 // =========================================================================
 
 class BufferStream extends Writable {
@@ -94,7 +94,7 @@ class BufferStream extends Writable {
 }
 
 class BasicFtpAdapter {
-  // Soporta FTP plano y FTPS via la libreria basic-ftp.
+  // Plain FTP and FTPS via the basic-ftp library.
   constructor(config) {
     this.config = config;
     const ftp = require('basic-ftp');
@@ -116,7 +116,7 @@ class BasicFtpAdapter {
       name: it.name,
       isDir: it.isDirectory || it.type === 2,
       size: it.size,
-      mtime: it.modifiedAt || null, // basic-ftp puede o no traerlo en LIST
+      mtime: it.modifiedAt || null, // basic-ftp may or may not return mtime in LIST
     }));
   }
   async readFile(remotePath) {
@@ -141,7 +141,7 @@ class BasicFtpAdapter {
 }
 
 class SftpAdapter {
-  // Soporta SFTP via ssh2-sftp-client.
+  // SFTP via ssh2-sftp-client.
   constructor(config) {
     this.config = config;
     const SftpClient = require('ssh2-sftp-client');
@@ -155,7 +155,7 @@ class SftpAdapter {
       password: this.config.pass,
       readyTimeout: 20000,
     };
-    // Soporte opcional de private key
+    // Optional private-key auth
     if (process.env.SFTP_KEY_PATH) {
       const fs = require('fs');
       opts.privateKey = fs.readFileSync(process.env.SFTP_KEY_PATH);
@@ -175,7 +175,7 @@ class SftpAdapter {
     }));
   }
   async readFile(remotePath) {
-    // get() sin destination devuelve Buffer
+    // get() without destination returns a Buffer
     return await this.client.get(remotePath);
   }
   async mtime(remotePath) {
@@ -194,7 +194,7 @@ function createAdapter(config) {
 }
 
 // =========================================================================
-// AUDITORIA. Independiente del protocolo, usa el adapter.
+// Audit core. Protocol-agnostic; uses the adapter interface.
 // =========================================================================
 
 async function walk(adapter, dir, out, depth = 0, maxDepth = 5) {
@@ -202,7 +202,7 @@ async function walk(adapter, dir, out, depth = 0, maxDepth = 5) {
   try {
     list = await adapter.list(dir);
   } catch (e) {
-    console.error(`  [WARN] no pude listar ${dir}: ${e.message}`);
+    console.error(`  [WARN] could not list ${dir}: ${e.message}`);
     return;
   }
   for (const it of list) {
@@ -230,14 +230,14 @@ function header(s) {
 (async () => {
   const adapter = createAdapter(C);
 
-  console.log(`Conectando a ${C.host}:${C.port} (${C.protocol.toUpperCase()})...`);
+  console.log(`Connecting to ${C.host}:${C.port} (${C.protocol.toUpperCase()})...`);
   try {
     await adapter.connect();
   } catch (e) {
-    console.error(`FATAL: no me pude conectar - ${e.message}`);
+    console.error(`FATAL: could not connect - ${e.message}`);
     process.exit(2);
   }
-  console.log(`OK conectado como ${C.user}, auditando ${C.path}\n`);
+  console.log(`OK connected as ${C.user}, auditing ${C.path}\n`);
 
   const items = [];
   await walk(adapter, C.path, items, 0);
@@ -293,10 +293,10 @@ function header(s) {
     }
   }
 
-  // Descargar y analizar contenido de cada PHP encontrado
+  // Download and analyze the content of each PHP file
   for (const phpFile of findings.php_files) {
     if (phpFile.size > 500_000) {
-      console.log(`  [SKIP] ${phpFile.path} muy grande (${phpFile.size}B), revisar a mano`);
+      console.log(`  [SKIP] ${phpFile.path} too large (${phpFile.size}B), review by hand`);
       continue;
     }
     try {
@@ -310,70 +310,70 @@ function header(s) {
         findings.php_with_hack.push({ path: phpFile.path, size: phpFile.size, matches });
       }
     } catch (e) {
-      console.error(`  [WARN] no pude leer ${phpFile.path}: ${e.message}`);
+      console.error(`  [WARN] could not read ${phpFile.path}: ${e.message}`);
     }
   }
 
-  // Descargar .htaccess completo
+  // Download the full .htaccess
   if (findings.htaccess_path) {
     try {
       const buf = await adapter.readFile(findings.htaccess_path);
       findings.htaccess_content = buf.toString('utf8');
     } catch (e) {
-      console.error(`  [WARN] no pude leer .htaccess: ${e.message}`);
+      console.error(`  [WARN] could not read .htaccess: ${e.message}`);
     }
   }
 
   // ============= REPORT =============
-  header('RESUMEN');
-  console.log(`Protocolo        : ${C.protocol.toUpperCase()}`);
-  console.log(`Archivos totales : ${files.length}`);
-  console.log(`Directorios      : ${dirs.length}`);
-  console.log(`Bytes totales    : ${(files.reduce((s, f) => s + (f.size || 0), 0) / 1024 / 1024).toFixed(2)} MB`);
+  header('SUMMARY');
+  console.log(`Protocol         : ${C.protocol.toUpperCase()}`);
+  console.log(`Total files      : ${files.length}`);
+  console.log(`Directories      : ${dirs.length}`);
+  console.log(`Total bytes      : ${(files.reduce((s, f) => s + (f.size || 0), 0) / 1024 / 1024).toFixed(2)} MB`);
 
-  header('ARCHIVOS NO ESPERADOS EN ROOT');
-  if (findings.unexpected_root.length === 0) console.log('  (ninguno) OK');
+  header('UNEXPECTED FILES IN ROOT');
+  if (findings.unexpected_root.length === 0) console.log('  (none) OK');
   else for (const f of findings.unexpected_root) console.log(`  ${f.isDir ? '[DIR] ' : '[FILE]'} ${f.path}  ${f.size || ''}B`);
 
-  header('NOMBRES SOSPECHOSOS');
-  if (findings.suspicious_names.length === 0) console.log('  (ninguno) OK');
+  header('SUSPICIOUS NAMES');
+  if (findings.suspicious_names.length === 0) console.log('  (none) OK');
   else for (const f of findings.suspicious_names) console.log(`  ${f.path}  match=${f.pattern}`);
 
-  header('ARCHIVOS PHP');
-  if (findings.php_files.length === 0) console.log('  (ninguno) OK');
+  header('PHP FILES');
+  if (findings.php_files.length === 0) console.log('  (none) OK');
   else for (const f of findings.php_files) console.log(`  ${f.path}  ${f.size}B`);
 
-  header('PHP CON PATRONES DE HACK');
-  if (findings.php_with_hack.length === 0) console.log('  (ninguno) OK');
+  header('PHP WITH HACK PATTERNS');
+  if (findings.php_with_hack.length === 0) console.log('  (none) OK');
   else for (const f of findings.php_with_hack) {
     console.log(`  ${f.path}  ${f.size}B`);
     for (const m of f.matches) console.log(`    -> ${m}`);
   }
 
-  header('DOTFILES (excepto .htaccess y .well-known)');
-  if (findings.dot_files.length === 0) console.log('  (ninguno) OK');
+  header('DOTFILES (excluding .htaccess and .well-known)');
+  if (findings.dot_files.length === 0) console.log('  (none) OK');
   else for (const f of findings.dot_files) console.log(`  ${f.path}  ${f.size}B`);
 
-  header('ARCHIVOS MODIFICADOS EN ULTIMOS 90 DIAS');
-  if (findings.recent_mods.length === 0) console.log('  (ninguno)');
+  header('FILES MODIFIED IN THE LAST 90 DAYS');
+  if (findings.recent_mods.length === 0) console.log('  (none)');
   else {
     findings.recent_mods.sort((a, b) => a.ageDays - b.ageDays);
     for (const f of findings.recent_mods.slice(0, 100)) {
-      console.log(`  ${f.path}  hace ${f.ageDays}d  ${f.size}B`);
+      console.log(`  ${f.path}  ${f.ageDays}d ago  ${f.size}B`);
     }
     if (findings.recent_mods.length > 100) {
-      console.log(`  ... y ${findings.recent_mods.length - 100} mas`);
+      console.log(`  ... and ${findings.recent_mods.length - 100} more`);
     }
   }
 
-  header('.htaccess (revisar redirects condicionales)');
+  header('.htaccess (review for conditional redirects)');
   if (findings.htaccess_content) {
     console.log(findings.htaccess_content);
   } else {
-    console.log('  (no encontrado o ilegible)');
+    console.log('  (not found or unreadable)');
   }
 
-  // Exit code: 0 si todo limpio, 1 si hubo hallazgos criticos
+  // Exit code: 0 if clean, 1 if critical findings, 2 already used for connect failures
   const hasCritical = findings.php_with_hack.length > 0 ||
                       findings.suspicious_names.length > 0;
   await adapter.close();
