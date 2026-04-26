@@ -1,16 +1,31 @@
 # ftp-audit
 
-Auditoría read-only de un sitio web en hosting compartido vía FTP. Detecta los vectores típicos de SEO injection, pharma hack, japanese keyword hack y backdoors PHP.
+Auditoría read-only de un sitio web en hosting compartido. Soporta **SFTP**, **FTPS** y **FTP** plano. Detecta los vectores típicos de SEO injection, pharma hack, japanese keyword hack y backdoors PHP.
 
-Pensado para pymes con sitios estáticos en hosting tipo cPanel/Plesk donde no hay SSH, solo FTP.
+Pensado para pymes con sitios estáticos en hosting tipo cPanel/Plesk.
+
+## Protocolos soportados
+
+| Protocolo | Puerto default | Encriptación | Recomendado | Cuándo usar |
+|---|---|---|---|---|
+| **SFTP** (FTP sobre SSH) | 22 | SSH | ✅ sí | Default. Hosting moderno (cPanel, Plesk, DreamHost, SiteGround, A2, Hostinger). También soporta auth por private key. |
+| **FTPS** (FTP sobre TLS) | 21 / 990 | TLS | ✅ sí | Hosting que da FTP "seguro" pero no SSH abierto. |
+| **FTP** plano | 21 | ❌ ninguna | ⚠ último recurso | Hosting compartido low-cost que solo expone FTP plano. Las credenciales viajan en cleartext, correr solo desde redes confiables. |
+
+Configurás el protocolo con `FTP_PROTOCOL=sftp | ftps | ftp` en `.env`. Default es `sftp`.
 
 ## Cómo funciona
 
 ```mermaid
 flowchart TD
-    A[FTP creds en .env] --> B[Conexion FTP / FTPS]
-    B --> C[Walk recursivo<br/>filesystem remoto]
-    C --> D[MDTM por archivo<br/>fechas reales]
+    A[Creds en .env<br/>FTP_PROTOCOL=sftp default] --> B{Protocolo}
+    B -->|sftp| S[SftpAdapter<br/>ssh2-sftp-client]
+    B -->|ftps| F[BasicFtpAdapter<br/>basic-ftp + TLS]
+    B -->|ftp| P[BasicFtpAdapter<br/>basic-ftp plano]
+    S --> C[Walk recursivo<br/>filesystem remoto]
+    F --> C
+    P --> C
+    C --> D[mtime por archivo]
     D --> E1[Archivos no esperados<br/>en root]
     D --> E2[Archivos PHP en<br/>sitios estaticos]
     D --> E3[Nombres sospechosos<br/>shell.php / c99 / .suspected]
@@ -24,9 +39,9 @@ flowchart TD
     E5 --> R
     E6 --> R
     R --> X{Hallazgos<br/>criticos?}
-    X -->|si| F[exit 1<br/>alertar]
-    X -->|no| G[exit 0<br/>OK]
-    B -.->|fallo conexion| H[exit 2<br/>error]
+    X -->|si| EX1[exit 1<br/>alertar]
+    X -->|no| EX0[exit 0<br/>OK]
+    B -.->|fallo conexion| EX2[exit 2<br/>error]
 ```
 
 Todo es READ-ONLY. No descarga al disco local, no modifica nada en el server. Lee a buffer en memoria, analiza y reporta.
@@ -36,11 +51,11 @@ Todo es READ-ONLY. No descarga al disco local, no modifica nada en el server. Le
 | Categoría | Hallazgo típico | Severidad | Acción sugerida |
 |---|---|---|---|
 | Archivos PHP en sitio estático | `contacto.php`, `mailer.php`, `wp-login.php` en sitio HTML puro | media | revisar contenido; legítimo si lo agregaste vos |
-| Nombres sospechosos | `shell.php`, `c99.php`, `r57.php`, `*.suspected`, `.bak` | crítica | borrar y rotar credenciales FTP |
+| Nombres sospechosos | `shell.php`, `c99.php`, `r57.php`, `*.suspected`, `.bak` | crítica | borrar y rotar credenciales |
 | Patrones de backdoor en PHP | `eval(base64_decode(...))`, `assert($_POST[...])`, `preg_replace('/.../e')`, `system($_GET[...])` | crítica | eliminar archivo, scan completo de host |
 | .htaccess con redirects condicionales | `RewriteCond` por `User-Agent` / `Referrer` / `Accept-Language` | media | revisar manualmente; legítimo si redirige por idioma, sospechoso si por googlebot |
 | Archivos fuera del root esperado | `/public_html/seo/`, `/public_html/pgsoft/`, dominios pharma/casino | crítica | borrar y solicitar reindexación a Google |
-| Archivos modificados fuera de ventana | Cualquier escritura sin deploy correspondiente en últimos 7 días | media | correlacionar con logs de FTP del hosting |
+| Archivos modificados fuera de ventana | Cualquier escritura sin deploy correspondiente en últimos 90 días | media | correlacionar con logs del hosting |
 
 Exit codes para integrar con cron + alerter:
 
@@ -64,25 +79,64 @@ git clone https://github.com/sarteta/ftp-audit.git
 cd ftp-audit
 npm install
 cp .env.example .env
-# editá .env con tus credenciales FTP
+# editá .env con tu protocolo y credenciales
 node ftp-audit.js
 ```
 
 ## Configuración (`.env`)
 
+Mínimo para SFTP (recomendado):
+
 ```
+FTP_PROTOCOL=sftp
 FTP_HOST=tu-host.example.com
 FTP_USER=tu-usuario
 FTP_PASS=tu-password
 FTP_PATH=/public_html
-FTP_PORT=21
-FTP_SECURE=false
+```
+
+Mínimo para FTPS:
+
+```
+FTP_PROTOCOL=ftps
+FTP_HOST=tu-host.example.com
+FTP_USER=tu-usuario
+FTP_PASS=tu-password
+FTP_PATH=/public_html
+```
+
+Mínimo para FTP plano (no recomendado, solo redes confiables):
+
+```
+FTP_PROTOCOL=ftp
+FTP_HOST=tu-host.example.com
+FTP_USER=tu-usuario
+FTP_PASS=tu-password
+FTP_PATH=/public_html
+```
+
+### Auth por private key (solo SFTP)
+
+Si tu hosting permite SSH key, podés usar key en lugar de password:
+
+```
+FTP_PROTOCOL=sftp
+FTP_HOST=tu-host.example.com
+FTP_USER=tu-usuario
+SFTP_KEY_PATH=/home/usuario/.ssh/id_rsa
+SFTP_KEY_PASSPHRASE=
+FTP_PATH=/public_html
+```
+
+Si seteás `SFTP_KEY_PATH`, `FTP_PASS` se ignora.
+
+### Whitelist de root (`EXPECTED_ROOT`)
+
+```
 EXPECTED_ROOT=index.html,index.php,robots.txt,sitemap.xml,favicon.ico,.htaccess,css,js,img,images,assets,fonts
 ```
 
-`EXPECTED_ROOT` es la whitelist de archivos/carpetas que tu sitio sí debería tener en root. Cualquier cosa fuera de esa lista se reporta como sospechosa. Personalizalo según tu sitio.
-
-Si tu hosting soporta FTPS (FTP sobre TLS), poné `FTP_SECURE=true`. Si soporta SFTP de verdad, mejor cambiate a un script con `ssh2-sftp-client`. Este script asume FTP plano porque es lo más común en hosting compartido low-cost.
+Cualquier archivo o carpeta en el root que no esté en esta lista se reporta como sospechoso. Personalizalo según tu sitio.
 
 ## Salida
 
@@ -90,6 +144,7 @@ Si tu hosting soporta FTPS (FTP sobre TLS), poné `FTP_SECURE=true`. Si soporta 
 ========================================
 RESUMEN
 ========================================
+Protocolo        : SFTP
 Archivos totales : 89
 Directorios      : 6
 Bytes totales    : 37.25 MB
@@ -136,7 +191,8 @@ PHP CON PATRONES DE HACK
 - No detecta hacks que viven 100% fuera del filesystem (DB injections, malicious cron, registros DNS comprometidos)
 - No detecta cloaking si el servidor solo se compromete cuando ve User-Agent específico. Para eso probar `curl -A "Googlebot" tudominio.com` y comparar con `curl tudominio.com`
 - Whitelist de nombres sospechosos es heurística, hay falsos positivos. Revisar cada match con criterio
-- El pattern matching de PHP detecta los backdoors clásicos, no los obfuscados con técnicas custom
+- El pattern matching de PHP detecta los backdoors clásicos, no obfuscados con técnicas custom
+- Para sitios muy grandes (>5000 archivos) puede tardar varios minutos. Ajustar `maxDepth` en el código si tu árbol es muy profundo
 
 Si el script dice "todo limpio" y aun así sospechás del sitio:
 

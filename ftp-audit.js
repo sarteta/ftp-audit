@@ -1,37 +1,46 @@
 #!/usr/bin/env node
 /**
  * ftp-audit.js
- * Auditoria READ-ONLY de un sitio web servido sobre hosting compartido via FTP.
- * Detecta los vectores tipicos de SEO injection / pharma hack / japanese keyword hack.
+ * Auditoria READ-ONLY de un sitio web servido sobre hosting compartido.
+ * Soporta tres protocolos:
+ *   - SFTP (FTP sobre SSH, puerto 22)         <- recomendado, encriptado
+ *   - FTPS (FTP sobre TLS, puerto 21 o 990)   <- encriptado
+ *   - FTP plano (puerto 21)                   <- creds en cleartext, evitar
+ *
+ * Detecta los vectores tipicos de SEO injection / pharma hack / japanese
+ * keyword hack / backdoors PHP. Todo read-only: NO descarga al disco local,
+ * NO modifica nada en el server.
  *
  * Uso:
  *   1. Copia .env.example a .env y completa credenciales
  *   2. npm install
  *   3. node ftp-audit.js
  *
- * Que hace (todo read-only, NO descarga ni modifica nada del server):
- *   - Walk recursivo del filesystem remoto via FTP
- *   - MDTM por archivo para fechas reales (LIST en muchos servers no las da)
- *   - Pattern matching para backdoors PHP conocidos
- *   - Whitelist de archivos esperados, todo lo demas se marca
- *   - Heuristicas de nombre (shell.php, c99.php, .suspected, .bak, wp-* en sitios sin WP)
- *   - Lectura de .htaccess para detectar redirects condicionales
- *   - Reporte estructurado por categoria
- *
- * Licencia: MIT. Usalo, modificalo, compartilo.
+ * Licencia: MIT.
  */
 
 require('dotenv').config();
-const ftp = require('basic-ftp');
 const { Writable } = require('stream');
 
+// Resolver protocolo. FTP_PROTOCOL gana sobre FTP_SECURE (legacy).
+function resolveProtocol() {
+  const explicit = (process.env.FTP_PROTOCOL || '').toLowerCase().trim();
+  if (['sftp', 'ftps', 'ftp'].includes(explicit)) return explicit;
+  // Backwards-compat: FTP_SECURE=true significa FTPS
+  if ((process.env.FTP_SECURE || '').toLowerCase() === 'true') return 'ftps';
+  return 'sftp'; // default seguro
+}
+
+const PROTOCOL = resolveProtocol();
+const DEFAULT_PORT = PROTOCOL === 'sftp' ? 22 : 21;
+
 const C = {
+  protocol: PROTOCOL,
   host: process.env.FTP_HOST,
   user: process.env.FTP_USER,
   pass: process.env.FTP_PASS,
   path: process.env.FTP_PATH || '/public_html',
-  port: parseInt(process.env.FTP_PORT || '21', 10),
-  secure: (process.env.FTP_SECURE || 'false').toLowerCase() === 'true',
+  port: parseInt(process.env.FTP_PORT || DEFAULT_PORT, 10),
 };
 
 if (!C.host || !C.user || !C.pass) {
@@ -41,7 +50,6 @@ if (!C.host || !C.user || !C.pass) {
 }
 
 // Whitelist de archivos/carpetas esperados en root.
-// Personalizalo segun tu sitio. Todo lo demas en root se reporta como "no esperado".
 const EXPECTED_ROOT = new Set((process.env.EXPECTED_ROOT || [
   'index.html', 'index.php',
   'robots.txt', 'sitemap.xml', 'favicon.ico', '.htaccess',
@@ -75,44 +83,140 @@ const PHP_HACK_PATTERNS = [
   { re: /\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}/i, msg: 'Hex-encoded payload sospechoso' },
 ];
 
+// =========================================================================
+// ADAPTERS por protocolo. Misma interfaz para que walk + analisis no cambien.
+// =========================================================================
+
 class BufferStream extends Writable {
   constructor() { super(); this.chunks = []; }
   _write(chunk, _, cb) { this.chunks.push(chunk); cb(); }
   get data() { return Buffer.concat(this.chunks); }
 }
 
-async function downloadToBuffer(client, remote) {
-  const bs = new BufferStream();
-  await client.downloadTo(bs, remote);
-  return bs.data;
+class BasicFtpAdapter {
+  // Soporta FTP plano y FTPS via la libreria basic-ftp.
+  constructor(config) {
+    this.config = config;
+    const ftp = require('basic-ftp');
+    this.client = new ftp.Client(20000);
+    this.client.ftp.verbose = false;
+  }
+  async connect() {
+    await this.client.access({
+      host: this.config.host,
+      port: this.config.port,
+      user: this.config.user,
+      password: this.config.pass,
+      secure: this.config.protocol === 'ftps',
+    });
+  }
+  async list(remotePath) {
+    const items = await this.client.list(remotePath);
+    return items.map(it => ({
+      name: it.name,
+      isDir: it.isDirectory || it.type === 2,
+      size: it.size,
+      mtime: it.modifiedAt || null, // basic-ftp puede o no traerlo en LIST
+    }));
+  }
+  async readFile(remotePath) {
+    const bs = new BufferStream();
+    await this.client.downloadTo(bs, remotePath);
+    return bs.data;
+  }
+  async mtime(remotePath) {
+    try {
+      const r = await this.client.send(`MDTM ${remotePath}`);
+      const m = r.message && r.message.match(/(\d{14})/);
+      if (m) {
+        const s = m[1];
+        return new Date(
+          `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}T${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)}Z`
+        );
+      }
+    } catch {}
+    return null;
+  }
+  async close() { this.client.close(); }
 }
 
-async function safeMdtm(client, remote) {
-  try {
-    const r = await client.send(`MDTM ${remote}`);
-    const m = r.message && r.message.match(/(\d{14})/);
-    if (m) {
-      const s = m[1];
-      return new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(8, 10)}:${s.slice(10, 12)}:${s.slice(12, 14)}Z`);
+class SftpAdapter {
+  // Soporta SFTP via ssh2-sftp-client.
+  constructor(config) {
+    this.config = config;
+    const SftpClient = require('ssh2-sftp-client');
+    this.client = new SftpClient();
+  }
+  async connect() {
+    const opts = {
+      host: this.config.host,
+      port: this.config.port,
+      username: this.config.user,
+      password: this.config.pass,
+      readyTimeout: 20000,
+    };
+    // Soporte opcional de private key
+    if (process.env.SFTP_KEY_PATH) {
+      const fs = require('fs');
+      opts.privateKey = fs.readFileSync(process.env.SFTP_KEY_PATH);
+      delete opts.password;
+      if (process.env.SFTP_KEY_PASSPHRASE) opts.passphrase = process.env.SFTP_KEY_PASSPHRASE;
     }
-  } catch {}
-  return null;
+    await this.client.connect(opts);
+  }
+  async list(remotePath) {
+    const items = await this.client.list(remotePath);
+    // ssh2-sftp-client: type 'd' = dir, '-' = file, 'l' = link
+    return items.map(it => ({
+      name: it.name,
+      isDir: it.type === 'd',
+      size: it.size,
+      mtime: it.modifyTime ? new Date(it.modifyTime) : null,
+    }));
+  }
+  async readFile(remotePath) {
+    // get() sin destination devuelve Buffer
+    return await this.client.get(remotePath);
+  }
+  async mtime(remotePath) {
+    try {
+      const stat = await this.client.stat(remotePath);
+      return stat.modifyTime ? new Date(stat.modifyTime) : null;
+    } catch {}
+    return null;
+  }
+  async close() { await this.client.end(); }
 }
 
-async function walk(client, dir, out, depth = 0, maxDepth = 5) {
+function createAdapter(config) {
+  if (config.protocol === 'sftp') return new SftpAdapter(config);
+  return new BasicFtpAdapter(config);
+}
+
+// =========================================================================
+// AUDITORIA. Independiente del protocolo, usa el adapter.
+// =========================================================================
+
+async function walk(adapter, dir, out, depth = 0, maxDepth = 5) {
   let list;
   try {
-    list = await client.list(dir);
+    list = await adapter.list(dir);
   } catch (e) {
     console.error(`  [WARN] no pude listar ${dir}: ${e.message}`);
     return;
   }
   for (const it of list) {
     const full = `${dir}/${it.name}`.replace(/\/+/g, '/');
-    const isDir = it.isDirectory || it.type === 2;
-    out.push({ path: full, name: it.name, isDir, size: it.size, depth });
-    if (isDir && depth < maxDepth) {
-      await walk(client, full, out, depth + 1, maxDepth);
+    out.push({
+      path: full,
+      name: it.name,
+      isDir: it.isDir,
+      size: it.size,
+      mtime: it.mtime || null,
+      depth,
+    });
+    if (it.isDir && depth < maxDepth) {
+      await walk(adapter, full, out, depth + 1, maxDepth);
     }
   }
 }
@@ -124,22 +228,19 @@ function header(s) {
 }
 
 (async () => {
-  const client = new ftp.Client(20000);
-  client.ftp.verbose = false;
+  const adapter = createAdapter(C);
 
-  console.log(`Conectando a ${C.host}:${C.port} (${C.secure ? 'FTPS' : 'FTP'})...`);
+  console.log(`Conectando a ${C.host}:${C.port} (${C.protocol.toUpperCase()})...`);
   try {
-    await client.access({
-      host: C.host, port: C.port, user: C.user, password: C.pass, secure: C.secure,
-    });
+    await adapter.connect();
   } catch (e) {
     console.error(`FATAL: no me pude conectar - ${e.message}`);
-    process.exit(1);
+    process.exit(2);
   }
   console.log(`OK conectado como ${C.user}, auditando ${C.path}\n`);
 
   const items = [];
-  await walk(client, C.path, items, 0);
+  await walk(adapter, C.path, items, 0);
   const files = items.filter(i => !i.isDir);
   const dirs = items.filter(i => i.isDir);
 
@@ -155,39 +256,35 @@ function header(s) {
   };
 
   for (const it of items) {
-    // Whitelist en root (depth 0 y 1 dentro del path base)
     const inRoot = (it.depth === 0);
     if (inRoot && !EXPECTED_ROOT.has(it.name) && !it.name.startsWith('.')) {
       findings.unexpected_root.push(it);
     }
-    // Dotfiles
     if (it.name.startsWith('.') && it.name !== '.htaccess' && it.name !== '.well-known') {
       findings.dot_files.push(it);
     }
-    // Suspicious names
     for (const re of SUSPICIOUS_NAMES) {
       if (re.test(it.name) || re.test(it.path)) {
         findings.suspicious_names.push({ ...it, pattern: re.source });
         break;
       }
     }
-    // PHP files
     if (!it.isDir && /\.(php|phtml|php5|phar)$/i.test(it.name)) {
       findings.php_files.push(it);
     }
-    // .htaccess captura
     if (it.name === '.htaccess' && !it.isDir) {
       findings.htaccess_path = it.path;
     }
   }
 
-  // MDTM en archivos clave (.html, .php, .htaccess, .txt, .xml en root y subroot)
-  const criticalForMdtm = files.filter(f =>
+  // mtime: SFTP la trae en list(); FTP no. Solo pedimos explicito si falta.
+  const criticalForMtime = files.filter(f =>
     /\.(html?|php|txt|xml)$/i.test(f.name) || f.name === '.htaccess'
   ).slice(0, 200);
 
-  for (const f of criticalForMdtm) {
-    const dt = await safeMdtm(client, f.path);
+  for (const f of criticalForMtime) {
+    let dt = f.mtime;
+    if (!dt) dt = await adapter.mtime(f.path);
     if (dt) {
       const days = (Date.now() - dt.getTime()) / 86400000;
       f.mtime = dt;
@@ -203,7 +300,7 @@ function header(s) {
       continue;
     }
     try {
-      const buf = await downloadToBuffer(client, phpFile.path);
+      const buf = await adapter.readFile(phpFile.path);
       const txt = buf.toString('utf8');
       const matches = [];
       for (const p of PHP_HACK_PATTERNS) {
@@ -220,7 +317,7 @@ function header(s) {
   // Descargar .htaccess completo
   if (findings.htaccess_path) {
     try {
-      const buf = await downloadToBuffer(client, findings.htaccess_path);
+      const buf = await adapter.readFile(findings.htaccess_path);
       findings.htaccess_content = buf.toString('utf8');
     } catch (e) {
       console.error(`  [WARN] no pude leer .htaccess: ${e.message}`);
@@ -229,6 +326,7 @@ function header(s) {
 
   // ============= REPORT =============
   header('RESUMEN');
+  console.log(`Protocolo        : ${C.protocol.toUpperCase()}`);
   console.log(`Archivos totales : ${files.length}`);
   console.log(`Directorios      : ${dirs.length}`);
   console.log(`Bytes totales    : ${(files.reduce((s, f) => s + (f.size || 0), 0) / 1024 / 1024).toFixed(2)} MB`);
@@ -278,7 +376,7 @@ function header(s) {
   // Exit code: 0 si todo limpio, 1 si hubo hallazgos criticos
   const hasCritical = findings.php_with_hack.length > 0 ||
                       findings.suspicious_names.length > 0;
-  client.close();
+  await adapter.close();
   process.exit(hasCritical ? 1 : 0);
 })().catch(e => {
   console.error('FATAL:', e);
